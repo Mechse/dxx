@@ -1,9 +1,12 @@
 package main
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
+	"unicode"
 )
 
 // meshRanges are the doxx.net mesh prefixes ("chat-only" scope in the doxx
@@ -63,6 +66,13 @@ func RenderConfig(resp any) (string, error) {
 		return "", fmt.Errorf("wireguard response is missing %s; run with --debug to see the (redacted) fields", strings.Join(missing, ", "))
 	}
 
+	// Validate before interpolation: a JSON string must never add config lines.
+	for _, value := range []string{priv, addr4, addr6, peer, endpoint} {
+		if strings.ContainsAny(value, "\r\n\x00") {
+			return "", fmt.Errorf("wireguard field contains a control character")
+		}
+	}
+
 	var addrs []string
 	for _, a := range []string{addr4, addr6} {
 		for _, part := range strings.Split(a, ",") {
@@ -89,67 +99,147 @@ func RenderConfig(resp any) (string, error) {
 	fmt.Fprintf(&b, "Endpoint = %s\n", endpoint)
 	fmt.Fprintf(&b, "AllowedIPs = %s\n", strings.Join(meshRanges, ", "))
 	b.WriteString("PersistentKeepalive = 25\n")
-	return b.String(), nil
+	return rewriteConf(b.String())
 }
 
-// rewriteConf applies the safety rules to a ready-made wg-quick config.
+// rewriteConf parses downloaded text and emits only validated, supported fields.
+// Strip comments before recognizing sections, just as wg-quick does. Never
+// retain arbitrary source lines: wg-quick extensions can execute root commands.
 func rewriteConf(raw string) (string, error) {
 	var out []string
 	section := ""
-	sawPeer, sawKeepalive := false, false
-	flushPeer := func() {
-		if section == "peer" {
-			out = append(out, "AllowedIPs = "+strings.Join(meshRanges, ", "))
-			if !sawKeepalive {
-				out = append(out, "PersistentKeepalive = 25")
+	seen := map[string]bool{}
+	sawInterface, sawPeer := false, false
+	finish := func() error {
+		switch section {
+		case "interface":
+			if !seen["privatekey"] || !seen["address"] {
+				return fmt.Errorf("wireguard interface requires PrivateKey and Address")
 			}
+		case "peer":
+			if !seen["publickey"] || !seen["endpoint"] {
+				return fmt.Errorf("wireguard peer requires PublicKey and Endpoint")
+			}
+			out = append(out, "AllowedIPs = "+strings.Join(meshRanges, ", "), "PersistentKeepalive = 25")
 		}
+		return nil
 	}
 	out = append(out, "# managed by dxx")
 	for _, line := range strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n") {
-		trimmed := strings.TrimSpace(line)
-		lower := strings.ToLower(trimmed)
-		if strings.HasPrefix(trimmed, "[") {
-			flushPeer()
-			sawKeepalive = false
-			switch lower {
-			case "[interface]":
-				section = "interface"
-			case "[peer]":
-				section = "peer"
-				sawPeer = true
-			default:
-				section = "other"
-			}
-			out = append(out, trimmed)
+		line, _, _ = strings.Cut(line, "#")
+		line = strings.TrimSpace(line)
+		if line == "" {
 			continue
 		}
-		key, _, _ := strings.Cut(lower, "=")
-		key = strings.TrimSpace(key)
-		switch {
-		case section == "interface" && (key == "dns" || key == "postup" || key == "postdown" || key == "preup" || key == "predown"):
-			continue // never let a downloaded config run hooks or touch the resolver
-		case section == "peer" && key == "allowedips":
-			continue // replaced by mesh ranges in flushPeer
-		case section == "peer" && key == "persistentkeepalive":
-			sawKeepalive = true
+		if strings.HasPrefix(line, "[") {
+			if err := finish(); err != nil {
+				return "", err
+			}
+			seen = map[string]bool{}
+			switch strings.ToLower(line) {
+			case "[interface]":
+				if sawInterface || sawPeer {
+					return "", fmt.Errorf("wireguard config has a repeated or misplaced Interface section")
+				}
+				sawInterface, section = true, "interface"
+				out = append(out, "[Interface]")
+			case "[peer]":
+				if !sawInterface {
+					return "", fmt.Errorf("wireguard config must start with Interface")
+				}
+				sawPeer, section = true, "peer"
+				out = append(out, "", "[Peer]")
+			default:
+				return "", fmt.Errorf("wireguard config has an unsupported section")
+			}
+			continue
 		}
-		out = append(out, line)
+		key, value, ok := strings.Cut(line, "=")
+		if !ok || section == "" {
+			return "", fmt.Errorf("malformed wireguard config field")
+		}
+		key, value = strings.ToLower(strings.TrimSpace(key)), strings.TrimSpace(value)
+		canonical := ""
+		if section == "interface" {
+			canonical = map[string]string{"privatekey": "PrivateKey", "address": "Address", "listenport": "ListenPort", "mtu": "MTU"}[key]
+		} else {
+			canonical = map[string]string{"publickey": "PublicKey", "presharedkey": "PresharedKey", "endpoint": "Endpoint"}[key]
+		}
+		if canonical == "" {
+			continue // Discard hooks, DNS, routing overrides and unknown extensions.
+		}
+		if seen[key] && key != "address" {
+			return "", fmt.Errorf("duplicate wireguard %s field", canonical)
+		}
+		if err := validateWGField(key, value); err != nil {
+			return "", fmt.Errorf("invalid wireguard %s: %s", canonical, err)
+		}
+		seen[key] = true
+		out = append(out, canonical+" = "+value)
 	}
-	flushPeer()
+	if err := finish(); err != nil {
+		return "", err
+	}
 	if !sawPeer {
 		return "", fmt.Errorf("wireguard config has no [Peer] section")
 	}
-	// Collapse trailing blank lines.
-	s := strings.TrimRight(strings.Join(out, "\n"), "\n") + "\n"
-	return s, nil
+	return strings.Join(out, "\n") + "\n", nil
+}
+
+// Errors deliberately omit values, which may contain private keys.
+func validateWGField(key, value string) error {
+	if value == "" || strings.ContainsFunc(value, unicode.IsControl) {
+		return fmt.Errorf("empty value or control character")
+	}
+	switch key {
+	case "privatekey", "publickey", "presharedkey":
+		b, err := base64.StdEncoding.Strict().DecodeString(value)
+		if err != nil || len(b) != 32 {
+			return fmt.Errorf("expected a base64-encoded 32-byte key")
+		}
+	case "address":
+		for _, addr := range strings.Split(value, ",") {
+			addr = strings.TrimSpace(addr)
+			if net.ParseIP(addr) == nil {
+				if _, _, err := net.ParseCIDR(addr); err != nil {
+					return fmt.Errorf("expected IP addresses with optional prefixes")
+				}
+			}
+		}
+	case "endpoint":
+		host, port, err := net.SplitHostPort(value)
+		if err != nil || host == "" {
+			return fmt.Errorf("expected host:port")
+		}
+		if net.ParseIP(host) == nil {
+			for _, label := range strings.Split(strings.TrimSuffix(host, "."), ".") {
+				if label == "" || len(label) > 63 || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+					return fmt.Errorf("invalid endpoint hostname")
+				}
+				for _, c := range label {
+					if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-') {
+						return fmt.Errorf("invalid endpoint hostname")
+					}
+				}
+			}
+		}
+		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("invalid endpoint port")
+		}
+	case "listenport", "mtu":
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 0 || n > 65535 || (key == "mtu" && n == 0) {
+			return fmt.Errorf("invalid numeric value")
+		}
+	}
+	return nil
 }
 
 // findConfString looks for a string value that already is a wg-quick config.
 func findConfString(v any) string {
 	switch t := v.(type) {
 	case string:
-		if strings.Contains(t, "[Interface]") && strings.Contains(t, "[Peer]") {
+		if strings.Contains(strings.ToLower(t), "[interface]") && strings.Contains(strings.ToLower(t), "[peer]") {
 			return t
 		}
 	case map[string]any:

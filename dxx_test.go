@@ -1,7 +1,10 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"net"
 	"net/http"
@@ -13,6 +16,53 @@ import (
 	"sync"
 	"testing"
 )
+
+// Use the test executable as the CLI so only tests can trust mock API CAs.
+// Production builds contain neither this entry point nor a TLS bypass.
+func TestMain(m *testing.M) {
+	if os.Getenv("DXX_TEST_CLI") == "1" {
+		if path := os.Getenv("SSL_CERT_FILE"); path != "" {
+			pemData, err := os.ReadFile(path)
+			pool := x509.NewCertPool()
+			if err != nil || !pool.AppendCertsFromPEM(pemData) {
+				fmt.Fprintln(os.Stderr, "invalid mock API certificate")
+				os.Exit(1)
+			}
+			transport := http.DefaultTransport.(*http.Transport).Clone()
+			transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+			http.DefaultTransport = transport
+		}
+		main()
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
+
+func buildTestBinary(t *testing.T, path string) {
+	t.Helper()
+	if out, err := exec.Command("go", "test", "-c", "-o", path, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+	t.Setenv("DXX_TEST_CLI", "1")
+}
+
+// Deliberately synthetic keys: base64 of printable fixture text, never live credentials.
+const testPrivateKey = "cHJpdmF0ZWtleXByaXZhdGVrZXlwcml2YXRla2V5MDA="
+const testPublicKey = "c2VydmVya2V5c2VydmVya2V5c2VydmVya2V5c2VydjA="
+
+// Subprocesses exercise the same HTTPS-only policy as production. Trust only
+// this mock server's certificate through the test-only CLI entry point.
+func newTestAPIServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewTLSServer(handler)
+	t.Cleanup(srv.Close)
+	ca := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SSL_CERT_FILE", ca)
+	return srv
+}
 
 const sampleConf = `[Interface]
 PrivateKey = cHJpdmF0ZWtleXByaXZhdGVrZXlwcml2YXRla2V5MDA=
@@ -51,10 +101,10 @@ func TestRenderConfigFromFields(t *testing.T) {
 		"status":  "success",
 		"context": "ignored",
 		"config": map[string]any{
-			"private_key":       "priv",
+			"private_key":       testPrivateKey,
 			"assigned_ipv4":     "10.10.0.7",
 			"assigned_ipv6":     "2602:f5c1::7",
-			"server_public_key": "srv",
+			"server_public_key": testPublicKey,
 			"endpoint":          "zrh.doxx.net:51820",
 			"dns":               "10.10.10.10",
 		},
@@ -63,7 +113,7 @@ func TestRenderConfigFromFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Address = 10.10.0.7/32, 2602:f5c1::7/128", "PublicKey = srv", "AllowedIPs = 10.0.0.0/8, 2602:f5c1::/36"} {
+	for _, want := range []string{"Address = 10.10.0.7/32, 2602:f5c1::7/128", "PublicKey = " + testPublicKey, "AllowedIPs = 10.0.0.0/8, 2602:f5c1::/36"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q in:\n%s", want, out)
 		}
@@ -73,17 +123,17 @@ func TestRenderConfigFromFields(t *testing.T) {
 	}
 }
 
-// The shape config.doxx.net actually returns for wireguard=1.
+// The API response shape for wireguard=1, using synthetic keys and addresses.
 func TestRenderConfigNested(t *testing.T) {
 	resp := map[string]any{"status": "success", "config": map[string]any{
-		"interface": map[string]any{"address": "10.25.106.66/32, 2602:f5c1:d::15:200b/128", "dns": "10.10.10.10,fd53::", "private_key": "PRIV="},
-		"peer":      map[string]any{"allowed_ips": "0.0.0.0/0, ::/0", "endpoint": "wireguard.fra.eu.doxx.net:51820", "persistent_keepalive": float64(25), "public_key": "SERVERPUB="},
+		"interface": map[string]any{"address": "10.10.0.9/32, 2602:f5c1:1::9/128", "dns": "10.10.10.10,fd53::", "private_key": testPrivateKey},
+		"peer":      map[string]any{"allowed_ips": "0.0.0.0/0, ::/0", "endpoint": "wireguard.fra.eu.doxx.net:51820", "persistent_keepalive": float64(25), "public_key": testPublicKey},
 	}}
 	conf, err := RenderConfig(resp)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"PrivateKey = PRIV=", "Address = 10.25.106.66/32, 2602:f5c1:d::15:200b/128", "PublicKey = SERVERPUB=", "Endpoint = wireguard.fra.eu.doxx.net:51820", "AllowedIPs = 10.0.0.0/8, 2602:f5c1::/36"} {
+	for _, want := range []string{"PrivateKey = " + testPrivateKey, "Address = 10.10.0.9/32, 2602:f5c1:1::9/128", "PublicKey = " + testPublicKey, "Endpoint = wireguard.fra.eu.doxx.net:51820", "AllowedIPs = 10.0.0.0/8, 2602:f5c1::/36"} {
 		if !strings.Contains(conf, want) {
 			t.Errorf("missing %q in:\n%s", want, conf)
 		}
@@ -91,7 +141,7 @@ func TestRenderConfigNested(t *testing.T) {
 	if strings.Contains(conf, "0.0.0.0/0") || strings.Contains(conf, "DNS") {
 		t.Errorf("default route or DNS leaked into:\n%s", conf)
 	}
-	if got := ConfAddress(conf); got != "10.25.106.66" {
+	if got := ConfAddress(conf); got != "10.10.0.9" {
 		t.Errorf("ConfAddress = %q", got)
 	}
 }
@@ -214,12 +264,10 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func TestEndToEnd(t *testing.T) {
 	bin := filepath.Join(t.TempDir(), "dxx")
-	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
-		t.Fatalf("build: %v\n%s", err, out)
-	}
+	buildTestBinary(t, bin)
 
 	api := &fakeAPI{tunnels: []map[string]any{{"tunnel_token": "tt-laptop", "name": "macbook", "server": "vie", "assigned_ip": "10.10.0.5/32"}}}
-	srv := httptest.NewServer(api)
+	srv := newTestAPIServer(t, api)
 	defer srv.Close()
 
 	// Fake ssh: logs every remote script and its stdin, answers the preflight.
@@ -288,9 +336,7 @@ func TestEndToEnd(t *testing.T) {
 
 func TestRefusesSecondDoxxLink(t *testing.T) {
 	bin := filepath.Join(t.TempDir(), "dxx")
-	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
-		t.Fatalf("build: %v\n%s", err, out)
-	}
+	buildTestBinary(t, bin)
 	dir := t.TempDir()
 	fakeSSH := filepath.Join(dir, "ssh")
 	os.WriteFile(fakeSSH, []byte("#!/bin/sh\nprintf 'uid=0\\nsudo=ok\\nwg=yes\\nwgif=wg0\\ndoxxif=wg0\\n'\n"), 0o755)
@@ -333,9 +379,7 @@ esac
 
 func TestLockUnlock(t *testing.T) {
 	bin := filepath.Join(t.TempDir(), "dxx")
-	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
-		t.Fatalf("build: %v\n%s", err, out)
-	}
+	buildTestBinary(t, bin)
 	dir := t.TempDir()
 	logf, lockFile, fakeSSH := filepath.Join(dir, "ssh.log"), filepath.Join(dir, "LOCKED"), filepath.Join(dir, "ssh")
 	writeFakeSSH(t, fakeSSH, logf, lockFile, "1") // port 1 on localhost is closed
@@ -384,9 +428,7 @@ func TestLockUnlock(t *testing.T) {
 
 func TestLockAbortsWhenMeshFails(t *testing.T) {
 	bin := filepath.Join(t.TempDir(), "dxx")
-	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
-		t.Fatalf("build: %v\n%s", err, out)
-	}
+	buildTestBinary(t, bin)
 	dir := t.TempDir()
 	fakeSSH := filepath.Join(dir, "ssh")
 	os.WriteFile(fakeSSH, []byte(`#!/bin/sh
@@ -458,9 +500,7 @@ func TestFindTarget(t *testing.T) {
 func TestDxx(t *testing.T) {
 	dir := t.TempDir()
 	dxx := filepath.Join(dir, "dxx")
-	if out, err := exec.Command("go", "build", "-o", dxx, ".").CombinedOutput(); err != nil {
-		t.Fatalf("build: %v\n%s", err, out)
-	}
+	buildTestBinary(t, dxx)
 	logf := filepath.Join(dir, "argv.log")
 	fakeSSH := filepath.Join(dir, "ssh")
 	os.WriteFile(fakeSSH, []byte(`#!/bin/sh
@@ -531,11 +571,9 @@ echo "$*" > "`+logf+`"
 func TestNamedServers(t *testing.T) {
 	dir := t.TempDir()
 	dxx := filepath.Join(dir, "dxx")
-	if out, err := exec.Command("go", "build", "-o", dxx, ".").CombinedOutput(); err != nil {
-		t.Fatalf("build: %v\n%s", err, out)
-	}
+	buildTestBinary(t, dxx)
 	api := &fakeAPI{tunnels: []map[string]any{{"tunnel_token": "tt-laptop", "name": "macbook", "assigned_ip": "10.10.0.5"}}}
-	srv := httptest.NewServer(api)
+	srv := newTestAPIServer(t, api)
 	defer srv.Close()
 	logf, lockFile, fakeSSH := filepath.Join(dir, "ssh.log"), filepath.Join(dir, "LOCKED"), filepath.Join(dir, "ssh")
 	writeFakeSSH(t, fakeSSH, logf, lockFile, "1")
@@ -614,11 +652,9 @@ func TestNamedServers(t *testing.T) {
 func TestConnectDisconnect(t *testing.T) {
 	dir := t.TempDir()
 	dxx := filepath.Join(dir, "dxx")
-	if out, err := exec.Command("go", "build", "-o", dxx, ".").CombinedOutput(); err != nil {
-		t.Fatalf("build: %v\n%s", err, out)
-	}
+	buildTestBinary(t, dxx)
 	api := &fakeAPI{}
-	srv := httptest.NewServer(api)
+	srv := newTestAPIServer(t, api)
 	defer srv.Close()
 
 	// Fake wg-quick, wg and ping; DXX_SUDO= runs them without sudo.
@@ -721,10 +757,8 @@ esac`,
 func TestPasswordLoginUsesOneConnection(t *testing.T) {
 	dir := t.TempDir()
 	dxx := filepath.Join(dir, "dxx")
-	if out, err := exec.Command("go", "build", "-o", dxx, ".").CombinedOutput(); err != nil {
-		t.Fatalf("build: %v\n%s", err, out)
-	}
-	srv := httptest.NewServer(&fakeAPI{})
+	buildTestBinary(t, dxx)
+	srv := newTestAPIServer(t, &fakeAPI{})
 	defer srv.Close()
 	logf, fakeSSH := filepath.Join(dir, "ssh.log"), filepath.Join(dir, "ssh")
 	os.WriteFile(fakeSSH, []byte(`#!/bin/sh
@@ -785,12 +819,10 @@ func TestInstallKeyScript(t *testing.T) {
 func TestReset(t *testing.T) {
 	dir := t.TempDir()
 	dxx := filepath.Join(dir, "dxx")
-	if out, err := exec.Command("go", "build", "-o", dxx, ".").CombinedOutput(); err != nil {
-		t.Fatalf("build: %v\n%s", err, out)
-	}
+	buildTestBinary(t, dxx)
 	// "phone" stands for a tunnel made in the portal: reset must not touch it.
 	api := &fakeAPI{tunnels: []map[string]any{{"tunnel_token": "tt-portal", "name": "phone", "server": "vie", "assigned_ip": "10.10.0.77"}}}
-	srv := httptest.NewServer(api)
+	srv := newTestAPIServer(t, api)
 	defer srv.Close()
 
 	bin := filepath.Join(dir, "bin")
@@ -884,14 +916,12 @@ func TestReset(t *testing.T) {
 func TestRm(t *testing.T) {
 	dir := t.TempDir()
 	dxx := filepath.Join(dir, "dxx")
-	if out, err := exec.Command("go", "build", "-o", dxx, ".").CombinedOutput(); err != nil {
-		t.Fatalf("build: %v\n%s", err, out)
-	}
+	buildTestBinary(t, dxx)
 	api := &fakeAPI{tunnels: []map[string]any{
 		{"tunnel_token": "tt-laptop", "name": "macbook", "server": "vie", "assigned_ip": "10.10.0.5"},
 		{"tunnel_token": "tt-phone", "name": "phone", "server": "vie", "assigned_ip": "10.10.0.77"},
 	}}
-	srv := httptest.NewServer(api)
+	srv := newTestAPIServer(t, api)
 	defer srv.Close()
 	fakeSSH, hosts := filepath.Join(dir, "ssh"), filepath.Join(dir, "hosts.json")
 	writeFakeSSH(t, fakeSSH, filepath.Join(dir, "ssh.log"), filepath.Join(dir, "LOCKED"), "1")

@@ -3,10 +3,10 @@
 ssh over the doxx.net mesh, plus the tools to get a server there and lock it down. One binary.
 
 ```sh
-dxx connect           # this Mac joins the doxx mesh
-dxx up root@203.0.113.10 --as hetzner
-dxx lock hetzner      # public SSH closed
-dxx hetzner           # ssh, but over doxx
+dxx connect                            # this device joins the doxx mesh
+dxx up root@[ip] --as [name]   # Setup a remote device connection
+dxx lock [name]                        # public SSH closed
+dxx [name]                             # ssh, but over doxx
 ```
 
 ## Getting started
@@ -14,7 +14,7 @@ dxx hetzner           # ssh, but over doxx
 1. **Build and install dxx.**
 
    ```sh
-   go build -o dxx . && sudo install dxx /usr/local/bin/
+   go build -trimpath -o dxx . && sudo install dxx /usr/local/bin/
    ```
 
 2. **Install WireGuard** (used by `dxx connect` to bring the tunnel up on this Mac).
@@ -181,11 +181,11 @@ Idempotent: running it again reuses the tunnel and rule.
 
 1. Checks the tunnel is up, then **logs in over the mesh first**. If that fails, it stops and changes nothing.
 2. Arms a **rollback timer** on the server (default 5 min, `--confirm`) that removes the lock automatically.
-3. Installs a small nftables table (`inet dxx`) that drops new SSH connections on every interface except `lo` and `doxx0`, loaded at boot by `dxx-lock.service`. Established sessions are kept. If UFW is active, it also allows SSH on `doxx0`.
+3. Installs a small nftables table (`inet dxx`) that drops new SSH connections on every interface except `lo` and `doxx0`, loaded at boot by `dxx-lock.service`. Connections to the server’s addresses are filtered before destination NAT, so Docker-published ports are covered too. Established sessions are kept. If UFW is active, it also allows SSH on `doxx0`.
 4. Opens a **fresh** mesh SSH session and only then disarms the rollback. If that fails, public SSH comes back by itself.
 5. Checks from your Mac that the public port is really closed.
 
-`--all` drops all new public inbound traffic, not just SSH (web servers become mesh-only too). `--ports 22,2222` picks the ports.
+`--all` drops new public connections to the server’s addresses, including published container ports (web servers become mesh-only too). ICMP and DHCP replies remain allowed, as do established connections. `--ports 22,2222` picks the original host ports, before container port mapping. Traffic routed through the server to other addresses, including directly routed container addresses, is outside this host lock; protect those networks with a separate forwarding policy.
 
 `unlock` removes it again, over the mesh (falls back to public SSH). Emergency, from the Hetzner web console:
 
@@ -220,3 +220,33 @@ dxx rules rm   <tunnel> <from|all> [--port N]
 - The Hetzner **cloud** firewall is separate. `lock` doesn't touch it; the server-side lock is enough on its own.
 - The same applies to your Mac: on a `10.x` LAN, mesh peers inside that LAN's range aren't reachable; `connect` warns about this.
 - If the server is in a Hetzner private network (`10.0.0.0/16` etc.), mesh peers inside that range won't be reachable; `up` warns about this.
+
+## Security and testing
+
+Downloaded WireGuard configurations are rebuilt from validated keys, addresses,
+endpoints and supported numeric settings. Hooks, DNS changes, routing overrides
+and unknown extensions are discarded. Both JSON fields and config text follow
+these restrictions.
+
+API calls require HTTPS, including a custom `DOXX_API` URL. Redirects are refused
+so account and tunnel tokens cannot be forwarded to another endpoint.
+
+Run `go test ./...` and `go vet ./...` for the regular checks. The tests use mock
+HTTPS servers and synthetic credentials. To verify firewall behavior on an
+isolated Linux test machine, run as root:
+
+```sh
+DXX_NFT_TEST=1 go test -run TestFirewallPublishedPorts -v .
+```
+
+This requires `ip`, `nft`, `sysctl` and `python3`. It creates temporary network
+namespaces to test host and published container ports, mesh access, container
+outbound connections, selected host ports, and unlocking. It does not change the
+host network’s firewall. Existing server locks must be reapplied with the updated
+binary (`dxx lock <name>`, retaining any `--all` or `--ports` options).
+
+Keep real tokens, WireGuard configs, host state and diagnostic logs out of Git.
+The ignore rules cover the standard filenames, but do not protect secrets pasted
+into source files or files already tracked. Test credentials are synthetic; use
+synthetic addresses and keys when adding fixtures. Release binaries should be
+built with `-trimpath` to omit local source directory paths.

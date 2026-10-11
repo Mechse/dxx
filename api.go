@@ -78,6 +78,16 @@ func (e *APIError) Error() string {
 
 // Call invokes an endpoint and returns the decoded JSON body.
 func (c *Client) Call(endpoint string, params map[string]string, auth bool) (any, error) {
+	base, err := url.Parse(c.BaseURL)
+	if err != nil || base.Scheme != "https" || base.Hostname() == "" || base.User != nil || base.Fragment != "" {
+		return nil, fmt.Errorf("%s: DOXX_API must be an HTTPS URL without user credentials or a fragment", endpoint)
+	}
+	// Copy per request so injected clients retain their transport and timeout,
+	// while no redirect can replay a token-bearing POST to another destination.
+	httpClient := *c.HTTP
+	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
 	form := url.Values{}
 	form.Set(endpoint, "1")
 	for k, v := range params {
@@ -86,11 +96,14 @@ func (c *Client) Call(endpoint string, params map[string]string, auth bool) (any
 	if auth {
 		form.Set("token", c.Token)
 	}
-	resp, err := c.HTTP.PostForm(c.BaseURL, form)
+	resp, err := httpClient.PostForm(c.BaseURL, form)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", endpoint, err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return nil, fmt.Errorf("%s: API redirect refused (HTTP %d)", endpoint, resp.StatusCode)
+	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		return nil, fmt.Errorf("%s: reading response: %w", endpoint, err)
@@ -374,7 +387,7 @@ func redact(v any) any {
 				out[k] = "(omitted)"
 				continue
 			}
-			if strings.Contains(lk, "private") || strings.Contains(lk, "token") || strings.Contains(lk, "secret") || lk == "key" {
+			if strings.Contains(lk, "private") || strings.Contains(lk, "preshared") || strings.Contains(lk, "token") || strings.Contains(lk, "secret") || lk == "key" {
 				if s, ok := val.(string); ok && s != "" {
 					out[k] = "***redacted***"
 					continue
@@ -390,7 +403,7 @@ func redact(v any) any {
 		}
 		return out
 	case string:
-		if strings.Contains(t, "PrivateKey") {
+		if strings.Contains(strings.ToLower(t), "privatekey") || strings.Contains(strings.ToLower(t), "presharedkey") {
 			return redactConf(t)
 		}
 		return t
@@ -403,8 +416,8 @@ func redactConf(conf string) string {
 	lines := strings.Split(conf, "\n")
 	for i, l := range lines {
 		k, _, ok := strings.Cut(l, "=")
-		if ok && strings.EqualFold(strings.TrimSpace(k), "PrivateKey") {
-			lines[i] = "PrivateKey = ***redacted***"
+		if ok && (strings.EqualFold(strings.TrimSpace(k), "PrivateKey") || strings.EqualFold(strings.TrimSpace(k), "PresharedKey")) {
+			lines[i] = strings.TrimSpace(k) + " = ***redacted***"
 		}
 	}
 	return strings.Join(lines, "\n")

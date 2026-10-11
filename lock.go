@@ -34,8 +34,19 @@ func nftRuleset(iface string, ports []int, all bool) string {
 	var b strings.Builder
 	b.WriteString("# managed by dxx: inbound only via the doxx mesh\n")
 	b.WriteString("table inet dxx {}\ndelete table inet dxx\n")
-	b.WriteString("table inet dxx {\n\tchain input {\n")
+	b.WriteString("table inet dxx {\n")
+	// Run after conntrack (-200) but before destination NAT (-100). Published
+	// container ports are still addressed to this host here; filtering only
+	// input would miss them after Docker sends them down the forwarding path.
+	// Transit traffic (including container egress) is outside this host lock.
+	b.WriteString("\tchain prerouting {\n")
+	b.WriteString("\t\ttype filter hook prerouting priority -150; policy accept;\n")
+	b.WriteString("\t\tfib daddr type != local return\n")
+	b.WriteString("\t\tjump inbound\n\t}\n")
+	b.WriteString("\tchain input {\n")
 	b.WriteString("\t\ttype filter hook input priority -10; policy accept;\n")
+	b.WriteString("\t\tjump inbound\n\t}\n")
+	b.WriteString("\tchain inbound {\n")
 	b.WriteString("\t\tiifname \"lo\" accept\n")
 	fmt.Fprintf(&b, "\t\tiifname %q accept\n", iface)
 	b.WriteString("\t\tct state established,related accept\n")
